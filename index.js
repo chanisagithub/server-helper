@@ -14,6 +14,7 @@ const {
   EmbedBuilder,
   ButtonBuilder,
   ButtonStyle,
+  PermissionsBitField 
 } = require("discord.js");
 // Require dotenv to manage environment variables
 require("dotenv").config();
@@ -104,6 +105,79 @@ async function registerCommands() {
   }
 }
 
+// --- Define applyPermissionPreset function (can be global or a class method if you refactor later) ---
+async function applyPermissionPreset(guild, channelOrCategory, permString, createdOrFetchedRoles, errorLog) {
+    if (!permString) return; // No permission string to process
+
+    const everyoneRole = guild.roles.everyone;
+    const overwrites = []; // Array to hold permission overwrite objects
+
+    // Parse "private: Role1, Role2, ..."
+    const privateMatch = permString.match(/^private:\s*(.+)$/i);
+    if (privateMatch) {
+        const roleNames = privateMatch[1].split(',').map(name => name.trim().toLowerCase()); // Standardize to lowercase for lookup
+
+        // Deny @everyone ViewChannel
+        overwrites.push({
+            id: everyoneRole.id,
+            deny: [PermissionsBitField.Flags.ViewChannel],
+        });
+
+        for (const roleName of roleNames) {
+            const role = createdOrFetchedRoles.get(roleName.toLowerCase()) || // Check roles created in this run
+                         guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase()); // Check existing roles
+            
+            if (role) {
+                overwrites.push({
+                    id: role.id,
+                    allow: [PermissionsBitField.Flags.ViewChannel], // Allow specified roles to view
+                    // For now, other permissions (SendMessages, Connect, etc.) will be default for these roles.
+                    // We could expand this later to grant more comprehensive "access" permissions.
+                });
+            } else {
+                const warningMsg = `Role "${roleName}" for private preset on "${channelOrCategory.name}" not found.`;
+                console.warn(warningMsg);
+                errorLog.push(`Perm Warning: ${warningMsg}`); // Add to user-facing error log
+            }
+        }
+        console.log(`Prepared 'private' permissions for ${channelOrCategory.name} targeting roles: ${roleNames.join(', ')}`);
+    }
+
+    // TODO: Add parsing for other presets like [type: announcement; posters: ...] here later
+
+    if (overwrites.length > 0) {
+        try {
+            // Get existing overwrites to merge, if channelOrCategory already has some
+            const existingOverwrites = channelOrCategory.permissionOverwrites.cache.map(ov => ({
+                id: ov.id,
+                allow: ov.allow.bitfield,
+                deny: ov.deny.bitfield,
+                type: ov.type
+            }));
+            
+            // Naive merge: new overwrites take precedence for the same ID.
+            // A more sophisticated merge might be needed if presets conflict.
+            const finalOverwrites = [...existingOverwrites];
+            for (const newOverwrite of overwrites) {
+                const existingIndex = finalOverwrites.findIndex(ov => ov.id === newOverwrite.id);
+                if (existingIndex !== -1) {
+                    // If an overwrite for this role/member already exists, replace it
+                    finalOverwrites[existingIndex] = newOverwrite;
+                } else {
+                    finalOverwrites.push(newOverwrite);
+                }
+            }
+            
+            await channelOrCategory.permissionOverwrites.set(finalOverwrites, `Layout by bot: ${permString}`);
+            console.log(`Applied permissions "${permString}" to ${channelOrCategory.name}`);
+        } catch (permError) {
+            const errorMsg = `Failed to apply permissions "${permString}" to "${channelOrCategory.name}"`;
+            console.error(errorMsg + ":", permError);
+            errorLog.push(`Perm Error: ${errorMsg} - ${permError.message}`);
+        }
+    }
+}
+
 const pendingLayouts = new Map();
 
 // Listen for interactions (slash commands AND modal submissions)
@@ -152,384 +226,367 @@ Indent channels under category.`
           });
         }
       }
-    } else if (commandName === "layout_help") {
-      // --- HANDLER FOR NEW HELP COMMAND ---
-      try {
-        const helpEmbed = new EmbedBuilder()
-          .setColor(0x0099ff) // Blue color
-          .setTitle("📋 How to use `/server_layout`")
-          .setDescription(
-            "Use the `/server_layout` command to open a form. Here's how to fill it out:"
-          )
-          .addFields(
-            {
-              name: "1. Categories & Channels Field",
-              value:
-                "In the **first input box**, define your categories and the channels within them:\n\n" +
-                "🔹 **Categories**: Type each category name on a new line.\n" +
-                "🔹 **Channels**:\n" +
-                "  - Underneath a category name, **indent** channel names (e.g., use 2 spaces or a Tab at the start of the line).\n" +
-                "  - **Text Channels**: Prefix with `#` OR use no prefix (e.g., `  # general-chat` or `  rules`).\n" +
-                "  - **Voice Channels**: Prefix with `*`, `v:`, or `voice:` (e.g., `  * Lounge`, `  v:gaming-vc`, `  voice:music room`).",
-            },
-            {
-              name: "2. Roles Field",
-              value:
-                "In the **second input box**, list each role name you want to create, with each role on a new line.",
-            },
-            {
-              name: '📝 Example for "Categories & Channels" field:',
-              value:
-                "```markdown\n" +
-                "Community Hub\n" +
-                "  # welcome\n" +
-                "  # announcements\n" +
-                "  * General Voice Chat\n" +
-                "  v: Hangout Spot\n" +
-                "Project Area\n" +
-                "  # project-discussion\n" +
-                "  voice: Team Meeting\n" +
-                "Just A Category (no channels listed)\n" +
-                "```",
-            },
-            {
-              name: '👤 Example for "Roles" field:',
-              value:
-                "```markdown\n" +
-                "Member\n" +
-                "Contributor\n" +
-                "Team Lead\n" +
-                "```",
-            }
-          )
-          .setFooter({
-            text: "The bot will show a confirmation plan before creating anything.",
-          });
-
-        await interaction.reply({ embeds: [helpEmbed], ephemeral: true });
-      } catch (error) {
-        console.error("Error handling /layout_help command:", error);
-        await interaction.reply({
-          content: "Sorry, I couldn't display the help information right now.",
-          ephemeral: true,
-        });
-      }
-    }
-  } else if (interaction.isModalSubmit()) {
-    if (interaction.customId === "serverSetupModal_v2") {
-      try {
-        await interaction.deferReply({ ephemeral: true });
-
-        const layoutDefinitionRaw =
-          interaction.fields.getTextInputValue("layoutDefinition");
-        const roleNamesRaw = interaction.fields.getTextInputValue("roleNames");
-
-        const rolesToCreate = roleNamesRaw
-          .split("\n")
-          .map((name) => name.trim())
-          .filter((name) => name.length > 0);
-
-        const layoutData = [];
-        let currentCategoryData = null;
-        const lines = layoutDefinitionRaw
-          .split("\n")
-          .map((line) => line.trimEnd());
-
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (trimmedLine.length === 0) continue;
-
-          if (line.startsWith("  ") || line.startsWith("\t")) {
-            if (currentCategoryData) {
-              let channelName = trimmedLine;
-              let channelType = ChannelType.GuildText;
-              if (trimmedLine.startsWith("#"))
-                channelName = trimmedLine.substring(1).trim();
-              else if (trimmedLine.startsWith("*")) {
-                channelName = trimmedLine.substring(1).trim();
-                channelType = ChannelType.GuildVoice;
-              } else if (trimmedLine.toLowerCase().startsWith("v:")) {
-                channelName = trimmedLine.substring(2).trim();
-                channelType = ChannelType.GuildVoice;
-              } else if (trimmedLine.toLowerCase().startsWith("voice:")) {
-                channelName = trimmedLine.substring(6).trim();
-                channelType = ChannelType.GuildVoice;
-              }
-              if (channelName)
-                currentCategoryData.channels.push({
-                  name: channelName,
-                  type: channelType,
-                });
-            }
-          } else {
-            currentCategoryData = { name: trimmedLine, channels: [] };
-            layoutData.push(currentCategoryData);
-          }
-        }
-
-        if (layoutData.length === 0 && rolesToCreate.length === 0) {
-          await interaction.editReply({
-            content:
-              "ℹ️ Nothing to create. Please define categories/channels or roles.",
-            ephemeral: true,
-          });
-          return;
-        }
-
-        // --- Store parsed data for confirmation ---
-        const layoutId = interaction.id; // Use interaction ID as a temporary ID for the layout
-        pendingLayouts.set(layoutId, {
-          layoutData,
-          rolesToCreate,
-          originalInteractionId: interaction.id,
-        });
-
-        // --- BUILD CONFIRMATION EMBED ---
-        const confirmationEmbed = new EmbedBuilder()
-          .setColor(0x0099ff) // Blue for confirmation
-          .setTitle("Confirm Server Layout Plan")
-          .setDescription(
-            'Please review the items that will be created. Press "Confirm" to proceed or "Cancel".'
-          )
-          .setTimestamp();
-
-        if (layoutData.length > 0) {
-          let categoriesFieldString = "";
-          layoutData.forEach((catDef) => {
-            categoriesFieldString += `**${catDef.name}**\n`;
-            if (catDef.channels.length > 0) {
-              catDef.channels.forEach(
-                (chDef) =>
-                  (categoriesFieldString += `  ${
-                    chDef.type === ChannelType.GuildText ? "📝" : "🔊"
-                  } ${chDef.name}\n`)
-              );
-            } else {
-              categoriesFieldString += `  *(No channels for this category)*\n`;
-            }
-          });
-          if (categoriesFieldString)
-            confirmationEmbed.addFields({
-              name: "Planned Categories & Channels",
-              value:
-                categoriesFieldString.substring(0, 1020) +
-                (categoriesFieldString.length > 1020 ? "..." : ""),
-            });
-        }
-
-        if (rolesToCreate.length > 0) {
-          confirmationEmbed.addFields({
-            name: "Planned Roles",
-            value:
-              rolesToCreate.join("\n").substring(0, 1020) +
-              (rolesToCreate.join("\n").length > 1020 ? "..." : ""),
-          });
-        }
-
-        const confirmButton = new ButtonBuilder()
-          .setCustomId(`confirm_layout_${layoutId}`)
-          .setLabel("Confirm")
-          .setStyle(ButtonStyle.Success);
-
-        const cancelButton = new ButtonBuilder()
-          .setCustomId(`cancel_layout_${layoutId}`)
-          .setLabel("Cancel")
-          .setStyle(ButtonStyle.Danger);
-
-        const row = new ActionRowBuilder().addComponents(
-          confirmButton,
-          cancelButton
-        );
-
-        await interaction.editReply({
-          embeds: [confirmationEmbed],
-          components: [row],
-          ephemeral: true,
-        });
-
-        // Set a timeout to remove the pending layout if not confirmed
-        setTimeout(() => {
-          if (pendingLayouts.has(layoutId)) {
-            pendingLayouts.delete(layoutId);
-            console.log(
-              `Pending layout ${layoutId} timed out and was removed.`
-            );
-            // Optionally, edit the original message to indicate timeout
-            interaction
-              .editReply({
-                content: "Confirmation timed out.",
-                embeds: [],
-                components: [],
-              })
-              .catch(() => {}); // Ignore errors if message already gone
-          }
-        }, 60000); // 60 seconds timeout
-      } catch (error) {
-        console.error("Modal submit processing error:", error);
-        await interaction
-          .editReply({
-            content: "Error preparing layout confirmation.",
-            ephemeral: true,
-          })
-          .catch(console.error);
-      }
-    }
-  } else if (interaction.isButton()) {
-    // --- HANDLE BUTTON INTERACTIONS ---
-    const [action, type, layoutId] = interaction.customId.split("_"); // e.g., confirm_layout_xyz
-
-    if (type !== "layout" || !pendingLayouts.has(layoutId)) {
-      // Potentially an old button or invalid customId
-      await interaction
-        .reply({
-          content: "This confirmation is no longer valid or has expired.",
-          ephemeral: true,
-        })
-        .catch(console.error);
-      return;
-    }
-
-    await interaction.deferUpdate(); // Acknowledge button press immediately
-
-    const { layoutData, rolesToCreate } = pendingLayouts.get(layoutId);
-    pendingLayouts.delete(layoutId); // Remove from pending once handled
-
-    if (action === "confirm") {
-      await interaction.editReply({
-        content: "⚙️ Applying server layout... please wait.",
-        embeds: [],
-        components: [],
-      });
-
-      const guild = interaction.guild;
-      if (!guild) {
-        // Should not happen if original interaction was in guild
-        await interaction.followUp({
-          content: "Error: Guild not found.",
-          ephemeral: true,
-        });
-        return;
-      }
-
-      let createdItemsLog = { categories: [], roles: [], channels: {} };
-      let errorLog = [];
-
-      // --- Actual Creation Logic (copied from previous step) ---
-      for (const categoryDef of layoutData) {
-        try {
-          const createdCategory = await guild.channels.create({
-            name: categoryDef.name,
-            type: ChannelType.GuildCategory,
-            reason: `Layout by ${interaction.user.tag}`,
-          });
-          createdItemsLog.categories.push(createdCategory.name);
-          createdItemsLog.channels[createdCategory.name] = [];
-          for (const channelDef of categoryDef.channels) {
+    } else if (commandName === 'layout_help') { 
             try {
-              const createdChannel = await guild.channels.create({
-                name: channelDef.name,
-                type: channelDef.type,
-                parent: createdCategory.id,
-                reason: `Layout by ${interaction.user.tag}`,
-              });
-              createdItemsLog.channels[createdCategory.name].push(
-                `${channelDef.type === ChannelType.GuildText ? "📝" : "🔊"} ${
-                  createdChannel.name
-                }`
-              );
-            } catch (chError) {
-              errorLog.push(
-                `Channel "${channelDef.name}" (in ${categoryDef.name}): ${chError.message}`
-              );
+                const helpEmbed = new EmbedBuilder()
+                    .setColor(0x0099FF) // Blue color
+                    .setTitle('📋 How to use `/server_layout`')
+                    .setDescription("Use the `/server_layout` command to open a form. Here's how to fill it out to define your server's structure, including basic privacy settings:")
+                    .addFields(
+                        {
+                            name: '1. Categories & Channels Field',
+                            value: "In the **first input box**, define your categories and the channels within them:\n\n" +
+                                   "🔹 **Categories**: Type each category name on a new line.\n" +
+                                   "🔹 **Channels**:\n" +
+                                   "  - Underneath a category name, **indent** channel names (e.g., use 2 spaces or a Tab at the start of the line).\n" +
+                                   "  - **Text Channels**: Prefix with `#` OR use no prefix (e.g., `  # general-chat` or `  rules`).\n" +
+                                   "  - **Voice Channels**: Prefix with `*`, `v:`, or `voice:` (e.g., `  * Lounge`, `  v:gaming-vc`, `  voice:music room`)."
+                        },
+                        { // --- NEW FIELD FOR PERMISSIONS ---
+                            name: '🔒 Applying Permissions (Optional)',
+                            value: "You can apply basic privacy settings to categories or individual channels using a directive within square brackets `[]` directly after its name.\n\n" +
+                                   "**Private Access:**\n" +
+                                   "Makes the category or channel visible *only* to specified roles.\n" +
+                                   "- **Syntax**: `[private: RoleName1, RoleName2, ...]`\n" +
+                                   "  *(Replace RoleName1, etc., with actual role names. These roles should either exist on your server or be defined in the 'Roles Field' of the same setup.)*\n" +
+                                   "- **Effect**:\n" +
+                                   "     - `@everyone` will be **denied** permission to view.\n" +
+                                   "     - The listed roles will be **granted** permission to view.\n" +
+                                   "- **Category Example**: `Staff Discussion [private: Staff, Admin]`\n" +
+                                   "- **Channel Example**: `  #important-updates [private: Members]`\n\n" +
+                                   "*(More permission presets like 'announcement' channels might be added in the future!)*"
+                        },
+                        {
+                            name: '2. Roles Field',
+                            value: "In the **second input box**, list each role name you want to create, with each role on a new line. If you used role names in permission settings, ensure they are defined here or already exist on the server."
+                        },
+                        { // --- UPDATED EXAMPLE FIELD ---
+                            name: '📝 Example for "Categories & Channels" field (with permissions):',
+                            value: "```markdown\n" +
+                                   "Community Hub\n" +
+                                   "  # welcome\n" +
+                                   "  # announcements\n" +
+                                   "  * General Voice Chat [private: Members, VIP]\n" +
+                                   "Staff Section [private: Staff, Admin]\n" +
+                                   "  # mod-chat\n" +
+                                   "  # admin-only-lounge\n" +
+                                   "  * Staff Meeting VC\n" +
+                                   "Project Alpha [private: Project Alpha Team, Staff]\n" +
+                                   "  # design-discussion\n" +
+                                   "  voice: Alpha Team Voice\n" +
+                                   "Public Zone [private: @everyone]\n" + 
+                                   "  # general\n" +
+                                   "```"
+                        },
+                        {
+                            name: '👤 Example for "Roles" field:',
+                            value: "```markdown\n" +
+                                   "Members\n" +
+                                   "VIP\n" +
+                                   "Staff\n" +
+                                   "Admin\n" +
+                                   "Project Alpha Team\n" +
+                                   "```"
+                        }
+                    )
+                    .setFooter({ text: 'The bot will show a confirmation plan before creating anything.' });
+
+                await interaction.reply({ embeds: [helpEmbed], ephemeral: true });
+            } catch (error) {
+                console.error("Error handling /layout_help command:", error);
+                await interaction.reply({ content: "Sorry, I couldn't display the help information right now.", ephemeral: true });
             }
-          }
-        } catch (catError) {
-          errorLog.push(`Category "${categoryDef.name}": ${catError.message}`);
         }
-      }
-      for (const roleName of rolesToCreate) {
-        try {
-          const createdRole = await guild.roles.create({
-            name: roleName,
-            reason: `Layout by ${interaction.user.tag}`,
-          });
-          createdItemsLog.roles.push(createdRole.name);
-        } catch (rError) {
-          errorLog.push(`Role "${roleName}": ${rError.message}`);
-        }
-      }
-      // --- End of Creation Logic ---
-
-      const resultEmbed = new EmbedBuilder()
-        .setColor(errorLog.length > 0 ? 0xff0000 : 0x00ff00)
-        .setTitle("Server Layout Update Complete!")
-        .setTimestamp();
-      // (Build resultEmbed fields as in the previous step)
-      if (createdItemsLog.categories.length > 0) {
-        let categoriesFieldString = "";
-        for (const catName of createdItemsLog.categories) {
-          categoriesFieldString += `**${catName}**\n`;
-          if (
-            createdItemsLog.channels[catName] &&
-            createdItemsLog.channels[catName].length > 0
-          ) {
-            createdItemsLog.channels[catName].forEach(
-              (ch) => (categoriesFieldString += `  ${ch}\n`)
-            );
-          } else {
-            categoriesFieldString += `  *(No channels created for this category)*\n`;
-          }
-        }
-        if (categoriesFieldString)
-          resultEmbed.addFields({
-            name: "📁 Created Categories & Channels",
-            value:
-              categoriesFieldString.substring(0, 1020) +
-              (categoriesFieldString.length > 1020 ? "..." : ""),
-          });
-      }
-      if (createdItemsLog.roles.length > 0) {
-        resultEmbed.addFields({
-          name: "👤 Created Roles",
-          value:
-            createdItemsLog.roles.join("\n").substring(0, 1020) +
-            (createdItemsLog.roles.join("\n").length > 1020 ? "..." : ""),
-        });
-      }
-      if (errorLog.length > 0) {
-        resultEmbed.addFields({
-          name: "❌ Errors Encountered",
-          value:
-            errorLog.join("\n").substring(0, 1020) +
-            (errorLog.join("\n").length > 1020 ? "..." : ""),
-        });
-      }
-      if (
-        createdItemsLog.categories.length === 0 &&
-        createdItemsLog.roles.length === 0 &&
-        layoutData.length === 0 &&
-        rolesToCreate.length === 0 &&
-        errorLog.length === 0
-      ) {
-        resultEmbed.setDescription(
-          "ℹ️ No layout definition or roles were specified, or nothing was created."
-        );
-        resultEmbed.setColor(0xffff00);
-      }
-
-      await interaction.editReply({
-        content: null,
-        embeds: [resultEmbed],
-        components: [],
-      });
-    } else if (action === "cancel") {
-      await interaction.editReply({
-        content: "❌ Server layout creation cancelled by user.",
-        embeds: [],
-        components: [],
-      });
-    }
   }
+  if (interaction.isModalSubmit()) {
+              const layoutId = interaction.id; 
+              const layoutIdForTimeout = layoutId; // This line should be correct
+
+              setTimeout(() => {
+                  // CORRECTED: Use layoutIdForTimeout consistently
+                  if (pendingLayouts.has(layoutIdForTimeout)) { 
+                      pendingLayouts.delete(layoutIdForTimeout);
+                      console.log(`Pending layout ${layoutIdForTimeout} timed out and was removed.`);
+                  } else {
+                      console.log(`Timeout executed for layoutId ${layoutIdForTimeout}, but it was already processed or removed from pendingLayouts.`);
+                  }
+              }, 60000);
+      
+        if (interaction.customId === 'serverSetupModal_v2') {
+            try {
+                await interaction.deferReply({ ephemeral: true });
+
+                const layoutDefinitionRaw = interaction.fields.getTextInputValue('layoutDefinition');
+                const roleNamesRaw = interaction.fields.getTextInputValue('roleNames');
+
+                const rolesToCreateFromInput = roleNamesRaw.split('\n').map(name => name.trim()).filter(name => name.length > 0);
+                
+                const layoutData = []; // Will store { name, channels: [{ name, type, permString }], permString }
+                let currentCategoryData = null;
+                const lines = layoutDefinitionRaw.split('\n').map(line => line.trimEnd());
+
+                for (const line of lines) {
+                    const originalLineTrimmed = line.trim(); // For channel name prefix parsing
+                    if (originalLineTrimmed.length === 0) continue;
+
+                    // --- UPDATED PARSING to extract permission string ---
+                    let namePart = originalLineTrimmed;
+                    let permString = null;
+                    // Regex to capture (name part) and [permission string part]
+                    // It handles spaces before the [ and makes the permission part optional
+                    const permMatch = originalLineTrimmed.match(/^(.*?)\s*(\[(.*?)\])?$/);
+                    if (permMatch) {
+                        namePart = permMatch[1].trim(); // This is the name without the [perms]
+                        if (permMatch[3]) { // permMatch[3] is the content inside brackets
+                            permString = permMatch[3].trim();
+                        }
+                    }
+                    // --- END OF UPDATED PARSING ---
+
+                    if (line.startsWith('  ') || line.startsWith('\t')) { // Channel line
+                        if (currentCategoryData) {
+                            let channelName = namePart; // Use namePart for prefix checks
+                            let channelType = ChannelType.GuildText;
+                            
+                            // Re-evaluate prefixes based on namePart (which has [perms] stripped)
+                            if (namePart.startsWith('#')) {
+                                channelName = namePart.substring(1).trim();
+                            } else if (namePart.startsWith('*')) {
+                                channelName = namePart.substring(1).trim();
+                                channelType = ChannelType.GuildVoice;
+                            } else if (namePart.toLowerCase().startsWith('v:')) {
+                                channelName = namePart.substring(2).trim();
+                                channelType = ChannelType.GuildVoice;
+                            } else if (namePart.toLowerCase().startsWith('voice:')) {
+                                channelName = namePart.substring(6).trim();
+                                channelType = ChannelType.GuildVoice;
+                            } else {
+                                // If no prefix, it's the namePart itself, default to text
+                                channelName = namePart;
+                            }
+
+                            if (channelName) { // Ensure channelName isn't empty after stripping
+                                currentCategoryData.channels.push({ name: channelName, type: channelType, permString: permString });
+                            }
+                        }
+                    } else { // Category line
+                        // namePart already has [perms] stripped if they existed
+                        currentCategoryData = { name: namePart, channels: [], permString: permString };
+                        layoutData.push(currentCategoryData);
+                    }
+                }
+
+                if (layoutData.length === 0 && rolesToCreateFromInput.length === 0) {
+                    await interaction.editReply({ content: "ℹ️ Nothing to create. Please define categories/channels or roles.", ephemeral: true });
+                    return;
+                }
+                
+                
+                // Store rolesToCreateFromInput instead of rolesToCreate (which was defined later)
+                pendingLayouts.set(layoutId, { layoutData, rolesToCreate: rolesToCreateFromInput, originalInteractionId: interaction.id });
+
+                                
+                const confirmButton = new ButtonBuilder().setCustomId(`confirm_layout_${layoutId}`).setLabel('Confirm').setStyle(ButtonStyle.Success);
+                const cancelButton = new ButtonBuilder().setCustomId(`cancel_layout_${layoutId}`).setLabel('Cancel').setStyle(ButtonStyle.Danger);
+                const row = new ActionRowBuilder().addComponents(confirmButton, cancelButton);
+
+                // --- BUILD CONFIRMATION EMBED (Needs update later to show planned perms) ---
+                const confirmationEmbed = new EmbedBuilder()
+                    .setColor(0x0099FF) 
+                    .setTitle('Confirm Server Layout Plan')
+                    .setDescription('Review items to be created. Permissions will be applied as specified.\n*(Detailed permission plan in embed coming soon)*')
+                    .setTimestamp();
+
+                await interaction.editReply({ embeds: [confirmationEmbed], components: [row], ephemeral: true });
+                if (layoutData.length > 0) {
+                    let categoriesFieldString = "";
+                    layoutData.forEach(catDef => {
+                        categoriesFieldString += `**${catDef.name}** ${catDef.permString ? `*[${catDef.permString}]*` : ''}\n`;
+                        if (catDef.channels.length > 0) {
+                            catDef.channels.forEach(chDef => {
+                                let permSuffix = '';
+                                if (chDef.permString) {
+                                    permSuffix = '*[' + chDef.permString + ']*';
+                                }
+                                categoriesFieldString += `  ${chDef.type === ChannelType.GuildText ? '📝' : '🔊'} ${chDef.name} ${permSuffix}\n`;
+                            });
+                        } else {
+                            categoriesFieldString += `  *(No channels for this category)*\n`;
+                        }
+                    });
+                    if (categoriesFieldString) confirmationEmbed.addFields({ name: 'Planned Categories & Channels', value: categoriesFieldString.substring(0, 1020) + (categoriesFieldString.length > 1020 ? "..." : "") });
+                }
+
+                if (rolesToCreateFromInput.length > 0) {
+                    confirmationEmbed.addFields({ name: 'Planned Roles', value: rolesToCreateFromInput.join('\n').substring(0, 1020) + (rolesToCreateFromInput.join('\n').length > 1020 ? "..." : "") });
+                }
+
+
+                await interaction.editReply({ embeds: [confirmationEmbed], components: [row], ephemeral: true });
+                
+                setTimeout(() => {
+                if (pendingLayouts.has(layoutIdForTimeout)) {
+                    pendingLayouts.delete(layoutIdForTimeout);
+                    console.log(`Pending layout ${layoutIdForTimeout} timed out and was removed.`);
+                } else {
+                    console.log(`Timeout executed for layoutId ${layoutIdForTimeout}, but it was already processed or removed from pendingLayouts.`);
+                }
+            }, 60000);
+
+            } catch (error) { 
+                console.error("Modal submit processing error:", error);
+            // ... (Your updated catch block logic that defines its OWN error embed) ...
+            const errorProcessingEmbed = new EmbedBuilder()
+                .setColor(0xFF0000)
+                .setTitle('⚠️ Error Processing Submission')
+                // ... etc.
+            await interaction.editReply({ embeds: [errorProcessingEmbed], components: [] }).catch(e => console.error("Failed to edit reply with error embed:", e));
+        }
+        }
+    } else if (interaction.isButton()) {
+        const buttonReceivedTime = Date.now();
+        console.log(`[${new Date(buttonReceivedTime).toISOString()}] Button interaction received: ${interaction.customId}, User: ${interaction.user.tag}`);
+
+        const [action, type, layoutId] = interaction.customId.split('_');
+
+        if (type !== 'layout' || !pendingLayouts.has(layoutId)) {
+            const checkFailedTime = Date.now();
+            console.log(`[${new Date(checkFailedTime).toISOString()}] Button invalid/expired (pendingLayouts check for layoutId: ${layoutId}). User: ${interaction.user.tag}. Time taken for check: ${checkFailedTime - buttonReceivedTime}ms. Replying.`);
+            try {
+                await interaction.reply({ content: "This confirmation is no longer valid or has expired.", ephemeral: true });
+            } catch (replyError) {
+                console.error(`[${new Date().toISOString()}] Failed to send 'expired' reply for button ${interaction.customId}. User: ${interaction.user.tag}. Error:`, replyError);
+            }
+            return;
+        }
+        
+        const beforeDeferTime = Date.now();
+        const timeElapsedBeforeDefer = beforeDeferTime - buttonReceivedTime;
+        console.log(`[${new Date(beforeDeferTime).toISOString()}] Attempting to deferUpdate for button: ${interaction.customId}. User: ${interaction.user.tag}. Time elapsed before defer call: ${timeElapsedBeforeDefer}ms`);
+
+        try {
+            await interaction.deferUpdate();
+            const afterDeferTime = Date.now();
+            console.log(`[${new Date(afterDeferTime).toISOString()}] deferUpdate SUCCEEDED for: ${interaction.customId}. User: ${interaction.user.tag}. Total time to defer: ${afterDeferTime - buttonReceivedTime}ms`);
+        } catch (error) {
+            const deferFailedTime = Date.now();
+            console.error(`[${new Date(deferFailedTime).toISOString()}] deferUpdate FAILED for ${interaction.customId}. User: ${interaction.user.tag}. Time elapsed before failure: ${deferFailedTime - buttonReceivedTime}ms. Error:`, error);
+            // If deferUpdate fails, we generally cannot interact further with THIS button interaction.
+            // The user will see "This interaction failed" on their Discord client.
+            return; // Stop further processing for this interaction.
+        }
+
+        // If deferUpdate succeeded, proceed:
+        console.log(`[${new Date().toISOString()}] Defer successful. Processing action: ${action} for layoutId: ${layoutId}. User: ${interaction.user.tag}`);
+        const { layoutData, rolesToCreate } = pendingLayouts.get(layoutId); // rolesToCreate is correct here
+        pendingLayouts.delete(layoutId); 
+
+        if (action === 'confirm') {
+            // ... rest of your confirm logic (creating roles, categories, channels)
+            // Ensure this part is also robust and has error handling.
+            // For brevity, I'm not repeating the entire creation logic here, but it should follow.
+            // Example of starting the confirm logic:
+            await interaction.editReply({ content: '⚙️ Applying server layout... please wait.', embeds: [], components: [] });
+            const guild = interaction.guild;
+            if (!guild) { 
+                console.error(`[${new Date().toISOString()}] Guild not found during confirm action for layoutId: ${layoutId}. User: ${interaction.user.tag}`);
+                await interaction.followUp({ content: 'Error: Guild not found when trying to apply layout.', ephemeral: true }).catch(e => console.error("FollowUp error:", e));
+                return;
+            }
+
+            let createdItemsLog = { categories: [], roles: [], channels: {} };
+            let errorLog = [];
+            let createdOrFetchedRoles = new Map();
+
+            // --- STEP 1: Create All Roles ---
+            if (rolesToCreate && rolesToCreate.length > 0) {
+                for (const roleName of rolesToCreate) {
+                    try {
+                        const existingRole = guild.roles.cache.find(r => r.name.toLowerCase() === roleName.toLowerCase());
+                        if (existingRole) {
+                            console.log(`Role "${roleName}" already exists. Using existing.`);
+                            createdOrFetchedRoles.set(roleName.toLowerCase(), existingRole);
+                        } else {
+                            const createdRole = await guild.roles.create({ name: roleName, reason: `Layout by ${interaction.user.tag}` });
+                            createdItemsLog.roles.push(createdRole.name); 
+                            createdOrFetchedRoles.set(roleName.toLowerCase(), createdRole);
+                            console.log(`Created role: ${createdRole.name}`);
+                        }
+                    } catch (rError) { 
+                        errorLog.push(`Role "${roleName}": ${rError.message}`); 
+                        console.error(`Fail creating role "${roleName}":`, rError.message);
+                    }
+                }
+            }
+
+            // --- STEP 2: Create Categories and their Channels, then Apply Permissions ---
+            for (const categoryDef of layoutData) {
+                let createdCategory = null;
+                try {
+                    let existingCategory = guild.channels.cache.find(c => c.name.toLowerCase() === categoryDef.name.toLowerCase() && c.type === ChannelType.GuildCategory);
+                    if (existingCategory) {
+                        createdCategory = existingCategory;
+                        console.log(`Category "${categoryDef.name}" already exists. Using existing.`);
+                    } else {
+                        createdCategory = await guild.channels.create({ name: categoryDef.name, type: ChannelType.GuildCategory, reason: `Layout by ${interaction.user.tag}` });
+                        createdItemsLog.categories.push(createdCategory.name);
+                        console.log(`Created category: ${createdCategory.name}`);
+                    }
+                    if (!createdItemsLog.channels[createdCategory.name]) {
+                         createdItemsLog.channels[createdCategory.name] = [];
+                    }
+                    if (createdCategory && categoryDef.permString) {
+                        await applyPermissionPreset(guild, createdCategory, categoryDef.permString, createdOrFetchedRoles, errorLog);
+                    }
+                    for (const channelDef of categoryDef.channels) {
+                        let createdChannel = null;
+                        try {
+                            let existingChannel = guild.channels.cache.find(c => c.name.toLowerCase() === channelDef.name.toLowerCase() && c.parentId === createdCategory.id && c.type === channelDef.type);
+                            if(existingChannel){
+                                createdChannel = existingChannel;
+                                console.log(`Channel "${channelDef.name}" in category "${createdCategory.name}" already exists. Using existing.`);
+                            } else {
+                                createdChannel = await guild.channels.create({ 
+                                    name: channelDef.name, type: channelDef.type, parent: createdCategory.id, reason: `Layout by ${interaction.user.tag}` 
+                                });
+                                createdItemsLog.channels[createdCategory.name].push(`${channelDef.type === ChannelType.GuildText ? '📝' : '🔊'} ${createdChannel.name}`);
+                                console.log(`  Created channel: ${createdChannel.name} in ${createdCategory.name}`);
+                            }
+                            if (createdChannel && channelDef.permString) {
+                                await applyPermissionPreset(guild, createdChannel, channelDef.permString, createdOrFetchedRoles, errorLog);
+                            }
+                        } catch (chError) { 
+                            errorLog.push(`Channel "${channelDef.name}" (in ${categoryDef.name}): ${chError.message}`); 
+                            console.error(`Fail creating/finding channel "${channelDef.name}" in "${createdCategory.name}":`, chError.message);
+                        }
+                    }
+                } catch (catError) { 
+                    errorLog.push(`Category "${categoryDef.name}": ${catError.message}`); 
+                    console.error(`Fail creating/finding category "${categoryDef.name}":`, catError.message);
+                }
+            }
+            
+            const resultEmbed = new EmbedBuilder() /* ... build your result embed ... */ ;
+            resultEmbed.setColor(errorLog.length > 0 ? 0xFF0000 : 0x00FF00)
+                .setTitle('Server Layout Update Complete!')
+                .setTimestamp();
+            // (Populate fields as before)
+            // ...
+            if (createdItemsLog.categories.length > 0 || Object.values(createdItemsLog.channels).some(chArr => chArr.length > 0)) { /* ... */ }
+            if (createdItemsLog.roles.length > 0) { /* ... */ }
+            if (errorLog.length > 0) { /* ... */ }
+            if (!resultEmbed.data.fields && !resultEmbed.data.description) { /* ... */ }
+
+
+            await interaction.editReply({ content: null, embeds: [resultEmbed], components: [] });
+
+        } else if (action === 'cancel') {
+            console.log(`[${new Date().toISOString()}] Cancel action chosen for layoutId: ${layoutId}. User: ${interaction.user.tag}`);
+            await interaction.editReply({ content: '❌ Server layout creation cancelled by user.', embeds: [], components: [] });
+        }
+    }
+    // ... (process.on unhandledRejection) ...
+
 });
 
 // Log in to Discord with your client's token
