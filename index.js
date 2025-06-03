@@ -1,4 +1,3 @@
-// Require necessary discord.js classes
 const {
   Client,
   GatewayIntentBits,
