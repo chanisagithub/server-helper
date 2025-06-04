@@ -108,7 +108,7 @@ async function applyPermissionPreset(guild, channelOrCategory, permString, creat
     if (!permString) return; 
 
     const everyoneRole = guild.roles.everyone;
-    const overwrites = []; // Array to hold permission overwrite objects
+    const overwrites = []; 
 
     // Parse "private: Role1, Role2, ..."
     const privateMatch = permString.match(/^private:\s*(.+)$/i);
