@@ -104,9 +104,8 @@ async function registerCommands() {
   }
 }
 
-// --- Define applyPermissionPreset function (can be global or a class method if you refactor later) ---
 async function applyPermissionPreset(guild, channelOrCategory, permString, createdOrFetchedRoles, errorLog) {
-    if (!permString) return; // No permission string to process
+    if (!permString) return; 
 
     const everyoneRole = guild.roles.everyone;
     const overwrites = []; // Array to hold permission overwrite objects
